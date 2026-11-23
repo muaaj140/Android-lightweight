@@ -1,0 +1,104 @@
+name: Build Lightweight Android ROM
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_name:
+        description: "ROM codename or version label"
+        required: true
+        default: "LightROM-v1"
+      android_tag:
+        description: "Target tag or build profile"
+        required: true
+        default: "lightweight-core"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build-rom:
+    name: Assemble & Package Lightweight ROM
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prepare Build Directories & System Dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            zip \
+            unzip \
+            p7zip-full \
+            android-sdk-libsparse-utils \
+            python3 \
+            jq \
+            curl
+
+          mkdir -p workdir/prebuilt_apps
+          mkdir -p out
+
+      - name: Collect Prebuilt Apps into ROM Workspace
+        run: |
+          set -euo pipefail
+          APP_COUNT=0
+          if [ -d "prebuilt_apps" ]; then
+            while IFS= read -r -d '' apk_file; do
+              cp "$apk_file" workdir/prebuilt_apps/
+              APP_COUNT=$((APP_COUNT + 1))
+            done < <(find prebuilt_apps -maxdepth 2 -type f -name "*.apk" -print0)
+          fi
+          echo "Total APKs added to ROM workspace: $APP_COUNT"
+          ls -lh workdir/prebuilt_apps || true
+
+      - name: Run Custom ROM Build Script (If Present)
+        env:
+          ROM_NAME: ${{ github.event.inputs.rom_name || 'LightROM-v1' }}
+          ANDROID_TAG: ${{ github.event.inputs.android_tag || 'lightweight-core' }}
+        run: |
+          set -euo pipefail
+          if [ -f "scripts/build_rom.sh" ]; then
+            chmod +x scripts/build_rom.sh
+            ./scripts/build_rom.sh "$ROM_NAME" "$ANDROID_TAG"
+          else
+            echo "No custom scripts/build_rom.sh found. Packaging base lightweight ROM bundle..."
+            cat <<EOF > workdir/rom_manifest.json
+          {
+            "rom_name": "${ROM_NAME}",
+            "build_profile": "${ANDROID_TAG}",
+            "timestamp_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "included_apps": [
+          $(find workdir/prebuilt_apps -maxdepth 1 -type f -name "*.apk" -printf '    "%f",\n' | sed '$ s/,$//')
+            ]
+          }
+          EOF
+          fi
+
+      - name: Create Flashable / Distributable ROM Archive
+        env:
+          ROM_NAME: ${{ github.event.inputs.rom_name || 'LightROM-v1' }}
+        run: |
+          set -euo pipefail
+          ARCHIVE_NAME="${ROM_NAME}-${{ github.run_number }}.zip"
+          cd workdir
+          zip -r "../out/${ARCHIVE_NAME}" .
+          cd ..
+          sha256sum "out/${ARCHIVE_NAME}" > "out/${ARCHIVE_NAME}.sha256"
+          ls -lh out/
+
+      - name: Upload ROM Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lightweight-rom-build-${{ github.run_number }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
